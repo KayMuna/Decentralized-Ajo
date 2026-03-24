@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Map, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec};
 
 const MAX_MEMBERS: u32 = 50;
 const HARD_CAP: u32 = 100;
@@ -27,6 +27,7 @@ pub enum AjoError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CircleData {
     pub organizer: Address,
+    pub token_address: Address, // New field for USDC/XLM contract address
     pub contribution_amount: i128,
     pub frequency_days: u32,
     pub max_rounds: u32,
@@ -75,6 +76,8 @@ pub enum DataKey {
     VoteCast,
     /// Shuffled payout rotation order
     RotationOrder,
+    /// Round deadline timestamp
+    RoundDeadline,
 }
 
 #[contract]
@@ -86,6 +89,7 @@ impl AjoCircle {
     pub fn initialize_circle(
         env: Env,
         organizer: Address,
+        token_address: Address,
         contribution_amount: i128,
         frequency_days: u32,
         max_rounds: u32,
@@ -110,6 +114,7 @@ impl AjoCircle {
 
         let circle_data = CircleData {
             organizer: organizer.clone(),
+            token_address,
             contribution_amount,
             frequency_days,
             max_rounds,
@@ -219,6 +224,12 @@ impl AjoCircle {
             return Err(AjoError::InvalidInput);
         }
 
+        let circle: CircleData = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle)
+            .ok_or(AjoError::NotFound)?;
+
         let mut members: Map<Address, MemberData> = env
             .storage()
             .instance()
@@ -226,6 +237,10 @@ impl AjoCircle {
             .ok_or(AjoError::NotFound)?;
 
         if let Some(mut member_data) = members.get(member.clone()) {
+            // Transfer tokens from member to contract
+            let token_client = token::Client::new(&env, &circle.token_address);
+            token_client.transfer(&member, &env.current_contract_address(), &amount);
+
             member_data.total_contributed += amount;
             members.set(member.clone(), member_data);
         } else {
@@ -241,6 +256,7 @@ impl AjoCircle {
 
         // If all members have contributed this round, advance the deadline
         if round_contributions >= circle.member_count {
+            let deadline: u64 = env.storage().instance().get(&DataKey::RoundDeadline).unwrap_or(0);
             let next_deadline = deadline + (circle.frequency_days as u64) * 86_400;
             env.storage().instance().set(&DataKey::RoundDeadline, &next_deadline);
         }
@@ -348,6 +364,10 @@ impl AjoCircle {
 
             let payout = (circle.member_count as i128) * circle.contribution_amount;
 
+            // Transfer payout from contract to member
+            let token_client = token::Client::new(&env, &circle.token_address);
+            token_client.transfer(&env.current_contract_address(), &member, &payout);
+
             member_data.has_received_payout = true;
             member_data.total_withdrawn += payout;
 
@@ -387,6 +407,17 @@ impl AjoCircle {
             }
 
             let net_amount = amount - (amount * 10) / 100;
+
+            let circle: CircleData = env
+                .storage()
+                .instance()
+                .get(&DataKey::Circle)
+                .ok_or(AjoError::NotFound)?;
+
+            // Transfer net_amount from contract to member
+            let token_client = token::Client::new(&env, &circle.token_address);
+            token_client.transfer(&env.current_contract_address(), &member, &net_amount);
+
             member_data.total_withdrawn += amount;
 
             members.set(member, member_data);
@@ -599,6 +630,16 @@ impl AjoCircle {
             return Err(AjoError::InsufficientFunds);
         }
 
+        let circle: CircleData = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle)
+            .ok_or(AjoError::NotFound)?;
+
+        // Transfer refund from contract to member
+        let token_client = token::Client::new(&env, &circle.token_address);
+        token_client.transfer(&env.current_contract_address(), &member, &refund);
+
         member_data.total_withdrawn += refund;
         member_data.status = 2; // Exited
         members.set(member, member_data);
@@ -679,6 +720,16 @@ impl AjoCircle {
             return Err(AjoError::InsufficientFunds);
         }
 
+        let circle: CircleData = env
+            .storage()
+            .instance()
+            .get(&DataKey::Circle)
+            .ok_or(AjoError::NotFound)?;
+
+        // Transfer refund from contract to member
+        let token_client = token::Client::new(&env, &circle.token_address);
+        token_client.transfer(&env.current_contract_address(), &member, &refund);
+
         member_data.total_withdrawn += refund;
         member_data.status = 2; // Exited
         members.set(member, member_data);
@@ -696,7 +747,7 @@ impl AjoCircle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Address, Env};
+    use soroban_sdk::{testutils::Address as _, Address, Env, token};
 
     // ── Helper ────────────────────────────────────────────────────────────────
 
@@ -704,20 +755,30 @@ mod tests {
     /// contributed `contribution` tokens.
     fn setup_circle_with_member(
         env: &Env,
-    ) -> (AjoCircleClient<'_>, Address, Address) {
+    ) -> (AjoCircleClient<'_>, Address, Address, Address) {
         let contract_id = env.register_contract(None, AjoCircle);
         let client = AjoCircleClient::new(env, &contract_id);
 
         let organizer = Address::generate(env);
         let member = Address::generate(env);
+        let admin = Address::generate(env);
+        let token_address = env.register_stellar_asset_contract(admin.clone());
+        let token_admin = token::StellarAssetClient::new(env, &token_address);
+        let token_client = token::Client::new(env, &token_address);
+
+        // Mint tokens to participants
+        token_admin.mint(&organizer, &1000_i128);
+        token_admin.mint(&member, &1000_i128);
 
         client
-            .initialize_circle(&organizer, &100_i128, &7_u32, &12_u32, &5_u32);
+            .initialize_circle(&organizer, &token_address, &100_i128, &7_u32, &12_u32, &5_u32);
         client.add_member(&organizer, &member);
+        
+        // Approve contract to spend tokens
         client.contribute(&organizer, &200_i128);
         client.contribute(&member, &200_i128);
 
-        (client, organizer, member)
+        (client, organizer, member, token_address)
     }
 
     // ── Existing tests ────────────────────────────────────────────────────────
@@ -734,8 +795,9 @@ mod tests {
         let member_one = Address::generate(&env);
         let member_two = Address::generate(&env);
         let member_three = Address::generate(&env);
+        let token_address = Address::generate(&env);
 
-        let init = client.initialize_circle(&organizer, &100_i128, &7_u32, &12_u32, &2_u32);
+        let init = client.initialize_circle(&organizer, &token_address, &100_i128, &7_u32, &12_u32, &2_u32);
         assert_eq!(init, Ok(()));
 
         let first_join = client.add_member(&organizer, &member_one);
@@ -754,7 +816,7 @@ mod tests {
     fn test_panic_happy_path() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, organizer, _member) = setup_circle_with_member(&env);
+        let (client, organizer, _member, _token) = setup_circle_with_member(&env);
 
         // Before panic, is_panicked returns false
         assert!(!client.is_panicked());
@@ -772,7 +834,7 @@ mod tests {
     fn test_panic_only_organizer() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, _organizer, member) = setup_circle_with_member(&env);
+        let (client, _organizer, member, _token) = setup_circle_with_member(&env);
 
         // A regular member cannot trigger panic
         let result = client.panic(&member);
@@ -784,7 +846,12 @@ mod tests {
     fn test_emergency_refund_during_panic() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, organizer, member) = setup_circle_with_member(&env);
+        let (client, organizer, member, token_address) = setup_circle_with_member(&env);
+        let token_client = token::Client::new(&env, &token_address);
+
+        // Initial balances after setup_circle_with_member: 
+        // Minted 1000, contributed 200. Balance should be 800.
+        assert_eq!(token_client.balance(&member), 800_i128);
 
         // Trigger panic
         client.panic(&organizer);
@@ -792,10 +859,14 @@ mod tests {
         // Member claims emergency refund
         let refund = client.emergency_refund(&member);
         assert_eq!(refund, Ok(200_i128));
+        
+        // Balance should now be 1000
+        assert_eq!(token_client.balance(&member), 1000_i128);
 
         // Organizer claims emergency refund
         let org_refund = client.emergency_refund(&organizer);
         assert_eq!(org_refund, Ok(200_i128));
+        assert_eq!(token_client.balance(&organizer), 1000_i128);
 
         // Second refund attempt fails (already withdrawn)
         let double = client.emergency_refund(&member);
@@ -806,7 +877,7 @@ mod tests {
     fn test_emergency_refund_without_panic() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, _organizer, member) = setup_circle_with_member(&env);
+        let (client, _organizer, member, _token) = setup_circle_with_member(&env);
 
         // Refund should fail when circle is not panicked
         let result = client.emergency_refund(&member);
@@ -817,7 +888,7 @@ mod tests {
     fn test_panic_blocks_contribute() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, organizer, member) = setup_circle_with_member(&env);
+        let (client, organizer, member, _token) = setup_circle_with_member(&env);
 
         client.panic(&organizer);
 
@@ -829,7 +900,7 @@ mod tests {
     fn test_panic_blocks_join() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, organizer, _member) = setup_circle_with_member(&env);
+        let (client, organizer, _member, _token) = setup_circle_with_member(&env);
 
         client.panic(&organizer);
 
