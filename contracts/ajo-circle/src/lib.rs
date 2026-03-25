@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod factory;
+
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec};
 
 const MAX_MEMBERS: u32 = 50;
@@ -22,6 +24,8 @@ pub enum AjoError {
     CircleAlreadyDissolved = 12,
     CircleAtCapacity = 13,
     CirclePanicked = 14,
+    PriceUnavailable = 15,
+    ArithmeticOverflow = 16,
 }
 
 #[contracttype]
@@ -79,6 +83,8 @@ pub enum DataKey {
     Circle,
     Members,
     Standings,
+    Admin,
+    KycStatus,
     CircleStatus,
     DissolutionVote,
     /// Tracks which members have already voted (stored as Map<Address, bool>)
@@ -87,6 +93,12 @@ pub enum DataKey {
     RotationOrder,
     /// Round deadline timestamp
     RoundDeadline,
+    /// Number of members who have completed current round contribution
+    RoundContribCount,
+    /// ETH/USD oracle price (scaled by `EthUsdDecimals`)
+    EthUsdPrice,
+    /// Decimals used by `EthUsdPrice`
+    EthUsdDecimals,
 }
 
 #[contract]
@@ -94,6 +106,34 @@ pub struct AjoCircle;
 
 #[contractimpl]
 impl AjoCircle {
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), AjoError> {
+        admin.require_auth();
+
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AjoError::NotFound)?;
+
+        if stored_admin != *admin {
+            return Err(AjoError::Unauthorized);
+        }
+
+        Ok(())
+    }
+
+    fn pow10_checked(exp: u32) -> Result<i128, AjoError> {
+        let mut result: i128 = 1;
+        let mut i: u32 = 0;
+        while i < exp {
+            result = result
+                .checked_mul(10)
+                .ok_or(AjoError::ArithmeticOverflow)?;
+            i += 1;
+        }
+        Ok(result)
+    }
+
     /// Initialize a new Ajo circle
     pub fn initialize_circle(
         env: Env,
@@ -133,6 +173,8 @@ impl AjoCircle {
         };
 
         env.storage().instance().set(&DataKey::Circle, &circle_data);
+        env.storage().instance().set(&DataKey::Admin, &organizer);
+        env.storage().instance().set(&DataKey::RoundContribCount, &0_u32);
 
         // Set first round deadline: now + frequency_days converted to seconds
         let deadline = env.ledger().timestamp() + (frequency_days as u64) * 86_400;
@@ -194,12 +236,7 @@ impl AjoCircle {
             return Err(AjoError::AlreadyExists);
         }
 
-        let joined_member_count = circle
-            .member_count
-            .checked_sub(1)
-            .ok_or(AjoError::InvalidInput)?;
-
-        if joined_member_count >= circle.max_members {
+        if circle.member_count >= circle.max_members {
             return Err(AjoError::CircleAtCapacity);
         }
 
@@ -257,7 +294,7 @@ impl AjoCircle {
             return Err(AjoError::InvalidInput);
         }
 
-        let circle: CircleData = env
+        let mut circle: CircleData = env
             .storage()
             .instance()
             .get(&DataKey::Circle)
@@ -291,29 +328,61 @@ impl AjoCircle {
             .ok_or(AjoError::NotFound)?;
 
         if let Some(mut member_data) = members.get(member.clone()) {
+            let round_target = (circle.current_round as i128)
+                .checked_mul(circle.contribution_amount)
+                .ok_or(AjoError::ArithmeticOverflow)?;
+            let had_completed_round = member_data.total_contributed >= round_target;
+
             // Transfer tokens from member to contract
             let token_client = token::Client::new(&env, &circle.token_address);
             token_client.transfer(&member, &env.current_contract_address(), &amount);
 
-            member_data.total_contributed += amount;
+            member_data.total_contributed = member_data
+                .total_contributed
+                .checked_add(amount)
+                .ok_or(AjoError::ArithmeticOverflow)?;
+
+            let has_completed_round = member_data.total_contributed >= round_target;
+
             members.set(member.clone(), member_data);
+
+            if !had_completed_round && has_completed_round {
+                let mut round_contrib_count: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::RoundContribCount)
+                    .unwrap_or(0_u32);
+
+                round_contrib_count = round_contrib_count
+                    .checked_add(1)
+                    .ok_or(AjoError::ArithmeticOverflow)?;
+
+                if round_contrib_count >= circle.member_count {
+                    let deadline: u64 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::RoundDeadline)
+                        .unwrap_or(0);
+                    let next_deadline = deadline + (circle.frequency_days as u64) * 86_400;
+                    env.storage().instance().set(&DataKey::RoundDeadline, &next_deadline);
+
+                    if circle.current_round < circle.max_rounds {
+                        circle.current_round += 1;
+                    }
+
+                    round_contrib_count = 0;
+                    env.storage().instance().set(&DataKey::Circle, &circle);
+                }
+
+                env.storage()
+                    .instance()
+                    .set(&DataKey::RoundContribCount, &round_contrib_count);
+            }
         } else {
             return Err(AjoError::NotFound);
         }
 
-        // Count contributions this round (total_contributed tracks cumulative; use round * amount as threshold)
-        let round_contributions = members.iter()
-            .filter(|(_, m)| m.total_contributed >= (circle.current_round as i128) * circle.contribution_amount)
-            .count() as u32;
-
         env.storage().instance().set(&DataKey::Members, &members);
-
-        // If all members have contributed this round, advance the deadline
-        if round_contributions >= circle.member_count {
-            let deadline: u64 = env.storage().instance().get(&DataKey::RoundDeadline).unwrap_or(0);
-            let next_deadline = deadline + (circle.frequency_days as u64) * 86_400;
-            env.storage().instance().set(&DataKey::RoundDeadline, &next_deadline);
-        }
 
         Ok(())
     }
@@ -378,17 +447,8 @@ impl AjoCircle {
     }
 
     /// Slash a member for missing a contribution round
-    pub fn slash_member(env: Env, organizer: Address, member: Address) -> Result<(), AjoError> {
-        organizer.require_auth();
-
-        let circle: CircleData = env.storage()
-            .instance()
-            .get(&DataKey::Circle)
-            .ok_or(AjoError::NotFound)?;
-
-        if circle.organizer != organizer {
-            return Err(AjoError::Unauthorized);
-        }
+    pub fn slash_member(env: Env, admin: Address, member: Address) -> Result<(), AjoError> {
+        Self::require_admin(&env, &admin)?;
 
         let mut standings: Map<Address, MemberStanding> = env.storage()
             .instance()
@@ -406,6 +466,67 @@ impl AjoCircle {
         } else {
             Err(AjoError::NotFound)
         }
+    }
+
+    /// Update off-chain KYC tie for a member. Admin-only.
+    pub fn set_kyc_status(
+        env: Env,
+        admin: Address,
+        member: Address,
+        is_verified: bool,
+    ) -> Result<(), AjoError> {
+        Self::require_admin(&env, &admin)?;
+
+        let mut kyc: Map<Address, bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycStatus)
+            .unwrap_or_else(|| Map::new(&env));
+
+        kyc.set(member, is_verified);
+        env.storage().instance().set(&DataKey::KycStatus, &kyc);
+
+        Ok(())
+    }
+
+    /// Remove a dormant user from active standing. Admin-only.
+    pub fn boot_dormant_member(
+        env: Env,
+        admin: Address,
+        member: Address,
+    ) -> Result<(), AjoError> {
+        Self::require_admin(&env, &admin)?;
+
+        let mut standings: Map<Address, MemberStanding> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Standings)
+            .unwrap_or(Map::new(&env));
+
+        if let Some(mut standing) = standings.get(member.clone()) {
+            standing.is_active = false;
+            standings.set(member.clone(), standing);
+        } else {
+            return Err(AjoError::NotFound);
+        }
+
+        let mut members: Map<Address, MemberData> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Members)
+            .ok_or(AjoError::NotFound)?;
+
+        if let Some(mut member_data) = members.get(member.clone()) {
+            member_data.status = 2;
+            members.set(member, member_data);
+        } else {
+            return Err(AjoError::NotFound);
+        }
+
+        env.storage().instance().set(&DataKey::Standings, &standings);
+        env.storage().instance().set(&DataKey::Members, &members);
+
+        Ok(())
     }
 
     /// Claim payout when it's a member's turn
@@ -765,18 +886,8 @@ impl AjoCircle {
     /// Admin-triggered emergency halt. Only the organizer can call this.
     /// Sets the circle status to `Panicked`, which blocks all normal operations
     /// and enables `emergency_refund()` for every member.
-    pub fn panic(env: Env, organizer: Address) -> Result<(), AjoError> {
-        organizer.require_auth();
-
-        let circle: CircleData = env
-            .storage()
-            .instance()
-            .get(&DataKey::Circle)
-            .ok_or(AjoError::NotFound)?;
-
-        if circle.organizer != organizer {
-            return Err(AjoError::Unauthorized);
-        }
+    pub fn panic(env: Env, admin: Address) -> Result<(), AjoError> {
+        Self::require_admin(&env, &admin)?;
 
         let status = Self::get_circle_status(env.clone());
         if status == CircleStatus::Dissolved {
@@ -837,6 +948,69 @@ impl AjoCircle {
     /// Returns `true` when the circle is in emergency-halt state.
     pub fn is_panicked(env: Env) -> bool {
         Self::get_circle_status(env) == CircleStatus::Panicked
+    }
+
+    /// Returns true when a member has been marked KYC-verified by admin.
+    pub fn is_kyc_verified(env: Env, member: Address) -> bool {
+        let kyc: Map<Address, bool> = env
+            .storage()
+            .instance()
+            .get(&DataKey::KycStatus)
+            .unwrap_or_else(|| Map::new(&env));
+
+        kyc.get(member).unwrap_or(false)
+    }
+
+    /// Admin updates oracle ETH/USD price and decimals.
+    pub fn set_eth_usd_price(
+        env: Env,
+        admin: Address,
+        price: i128,
+        decimals: u32,
+    ) -> Result<(), AjoError> {
+        Self::require_admin(&env, &admin)?;
+
+        if price <= 0 {
+            return Err(AjoError::InvalidInput);
+        }
+
+        env.storage().instance().set(&DataKey::EthUsdPrice, &price);
+        env.storage().instance().set(&DataKey::EthUsdDecimals, &decimals);
+        Ok(())
+    }
+
+    /// Convert a USD amount to native token units using the stored ETH/USD oracle price.
+    /// `usd_amount` should use the same decimal scale as the oracle feed.
+    pub fn native_amount_for_usd(env: Env, usd_amount: i128) -> Result<i128, AjoError> {
+        if usd_amount <= 0 {
+            return Err(AjoError::InvalidInput);
+        }
+
+        let price: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EthUsdPrice)
+            .ok_or(AjoError::PriceUnavailable)?;
+        let decimals: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::EthUsdDecimals)
+            .ok_or(AjoError::PriceUnavailable)?;
+
+        let scale = Self::pow10_checked(decimals)?;
+        let numerator = usd_amount
+            .checked_mul(scale)
+            .ok_or(AjoError::ArithmeticOverflow)?;
+
+        let native = numerator
+            .checked_div(price)
+            .ok_or(AjoError::ArithmeticOverflow)?;
+
+        if native <= 0 {
+            return Err(AjoError::InvalidInput);
+        }
+
+        Ok(native)
     }
 }
 
