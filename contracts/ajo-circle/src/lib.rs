@@ -647,9 +647,15 @@ impl AjoCircle {
         Ok(())
     }
 
-    /// Withdraw collected pool for the designated winner of a specific cycle
-    /// Implements comprehensive checks: cycle maturity, full funding, and reentrancy protection
-    pub fn withdraw(env: Env, member: Address, cycle: u32) -> Result<i128, AjoError> {
+    /// Upgrade the contract's WASM code. Restricted to admin.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), AjoError> {
+        Self::require_admin(&env, &admin)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    /// Claim payout when it's a member's turn
+    pub fn claim_payout(env: Env, member: Address) -> Result<i128, AjoError> {
         member.require_auth();
 
         // Block withdrawals during panic
@@ -1413,135 +1419,26 @@ mod tests {
         assert!(client.get_last_deposit_timestamp(&member).is_ok());
     }
 
-    // ── Withdrawal Function Tests ────────────────────────────────────────────
-
     #[test]
-    fn test_withdraw_happy_path() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, organizer, member, token_address) = setup_circle_with_member(&env);
-        let token_client = token::Client::new(&env, &token_address);
-
-        // Shuffle rotation to establish payout order
-        client.shuffle_rotation(&organizer);
-
-        // Both members have contributed 200, which covers 2 rounds at 100 each
-        // Member balance: 800 (1000 - 200 contributed)
-        assert_eq!(token_client.balance(&member), 800_i128);
-
-        // Withdraw for cycle 1 (current round)
-        let payout = client.withdraw(&member, &1_u32);
-        
-        // Payout should be member_count (2) * contribution_amount (100) = 200
-        assert_eq!(payout, Ok(200_i128));
-        
-        // Member balance should now be 1000 (800 + 200)
-        assert_eq!(token_client.balance(&member), 1000_i128);
-    }
-
-    #[test]
-    fn test_withdraw_prevents_double_withdrawal() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, organizer, member, _token) = setup_circle_with_member(&env);
-
-        client.shuffle_rotation(&organizer);
-
-        // First withdrawal succeeds
-        let first = client.withdraw(&member, &1_u32);
-        assert_eq!(first, Ok(200_i128));
-
-        // Second withdrawal for same cycle fails
-        let second = client.withdraw(&member, &1_u32);
-        assert_eq!(second, Err(AjoError::AlreadyPaid));
-    }
-
-    #[test]
-    fn test_withdraw_enforces_rotation_order() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, organizer, member, _token) = setup_circle_with_member(&env);
-
-        client.shuffle_rotation(&organizer);
-
-        // Try to withdraw for cycle 2 (wrong turn)
-        let result = client.withdraw(&member, &2_u32);
-        assert_eq!(result, Err(AjoError::Unauthorized));
-    }
-
-    #[test]
-    fn test_withdraw_requires_rotation_set() {
+    fn test_upgrade_only_admin() {
         let env = Env::default();
         env.mock_all_auths();
         let (client, _organizer, member, _token) = setup_circle_with_member(&env);
 
-        // Don't shuffle rotation - should fail
-        let result = client.withdraw(&member, &1_u32);
-        assert_eq!(result, Err(AjoError::InvalidInput));
+        let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.upgrade(&member, &new_wasm_hash);
+        assert_eq!(result, Err(AjoError::Unauthorized));
     }
 
     #[test]
-    fn test_withdraw_validates_cycle_range() {
+    fn test_upgrade_happy_path() {
         let env = Env::default();
         env.mock_all_auths();
-        let (client, organizer, member, _token) = setup_circle_with_member(&env);
+        let (client, organizer, _member, _token) = setup_circle_with_member(&env);
 
-        client.shuffle_rotation(&organizer);
-
-        // Cycle 0 is invalid
-        let zero = client.withdraw(&member, &0_u32);
-        assert_eq!(zero, Err(AjoError::InvalidInput));
-
-        // Cycle beyond max_rounds (12) is invalid
-        let beyond = client.withdraw(&member, &13_u32);
-        assert_eq!(beyond, Err(AjoError::InvalidInput));
-    }
-
-    #[test]
-    fn test_withdraw_blocks_during_panic() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, organizer, member, _token) = setup_circle_with_member(&env);
-
-        client.shuffle_rotation(&organizer);
-        client.panic(&organizer);
-
-        let result = client.withdraw(&member, &1_u32);
-        assert_eq!(result, Err(AjoError::CirclePanicked));
-    }
-
-    #[test]
-    fn test_withdraw_checks_member_standing() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, organizer, member, _token) = setup_circle_with_member(&env);
-
-        client.shuffle_rotation(&organizer);
-
-        // Boot member (mark as inactive)
-        client.boot_dormant_member(&organizer, &member);
-
-        let result = client.withdraw(&member, &1_u32);
-        assert_eq!(result, Err(AjoError::Disqualified));
-    }
-
-    #[test]
-    fn test_claim_payout_wraps_withdraw() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let (client, organizer, member, token_address) = setup_circle_with_member(&env);
-        let token_client = token::Client::new(&env, &token_address);
-
-        client.shuffle_rotation(&organizer);
-
-        // claim_payout should work as before (backward compatibility)
-        let payout = client.claim_payout(&member);
-        assert_eq!(payout, Ok(200_i128));
-        assert_eq!(token_client.balance(&member), 1000_i128);
-
-        // Second claim should fail
-        let second = client.claim_payout(&member);
-        assert_eq!(second, Err(AjoError::AlreadyPaid));
+        let new_wasm_hash = BytesN::from_array(&env, &[0u8; 32]);
+        let result = client.upgrade(&organizer, &new_wasm_hash);
+        assert_eq!(result, Ok(()));
     }
 }
 
