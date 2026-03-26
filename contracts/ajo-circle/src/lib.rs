@@ -1,8 +1,3 @@
-//! # Ajo Circle Smart Contract (Admin Updated)
-//!
-//! A decentralized rotating savings and credit association (ROSCA) implementation on Stellar.
-//! Updated with Role-Based Access Control (RBAC) for administrative security.
-
 #![no_std]
 
 pub mod factory;
@@ -62,11 +57,18 @@ pub struct MemberData {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemberStanding {
+    pub missed_count: u32,
+    pub is_active: bool,
+}
+
+#[contracttype]
 pub enum DataKey {
     Circle,
     Members,
     Standings,
-    Admin, // The security key for Access Control
+    Admin, 
     KycStatus,
     CircleStatus,
     RotationOrder,
@@ -80,8 +82,7 @@ pub struct AjoCircle;
 
 #[contractimpl]
 impl AjoCircle {
-    /// Internal helper: Ensures the caller has the ADMIN_ROLE.
-    /// Replaces simple checks with formal Stellar authentication.
+    /// Verify that the caller is the circle administrator
     fn require_admin(env: &Env, admin: &Address) -> Result<(), AjoError> {
         admin.require_auth();
 
@@ -97,7 +98,6 @@ impl AjoCircle {
         Ok(())
     }
 
-    /// Initialize a new Ajo circle and assign the ADMIN_ROLE to the organizer.
     pub fn initialize_circle(
         env: Env,
         organizer: Address,
@@ -115,9 +115,6 @@ impl AjoCircle {
             return Err(AjoError::InvalidInput);
         }
 
-        // Set the Admin Role to the person who started the circle
-        env.storage().instance().set(&DataKey::Admin, &organizer);
-
         let circle_data = CircleData {
             organizer: organizer.clone(),
             token_address,
@@ -130,29 +127,47 @@ impl AjoCircle {
         };
 
         env.storage().instance().set(&DataKey::Circle, &circle_data);
-        // ... (Keep the rest of your storage initialization)
+        env.storage().instance().set(&DataKey::Admin, &organizer);
+        env.storage().instance().set(&DataKey::RoundContribCount, &0_u32);
+
+        let deadline = env.ledger().timestamp() + (frequency_days as u64) * 86_400;
+        env.storage().instance().set(&DataKey::RoundDeadline, &deadline);
+
+        let mut members: Map<Address, MemberData> = Map::new(&env);
+        members.set(organizer.clone(), MemberData {
+            address: organizer.clone(),
+            total_contributed: 0,
+            total_withdrawn: 0,
+            has_received_payout: false,
+            status: 0,
+        });
+        env.storage().instance().set(&DataKey::Members, &members);
+
+        let mut standings: Map<Address, MemberStanding> = Map::new(&env);
+        standings.set(organizer.clone(), MemberStanding { missed_count: 0, is_active: true });
+        env.storage().instance().set(&DataKey::Standings, &standings);
+
         Ok(())
     }
 
-    /// Update off-chain KYC status. Restricted to ADMIN_ROLE.
-    pub fn set_kyc_status(
-        env: Env,
-        admin: Address,
-        member: Address,
-        is_verified: bool,
-    ) -> Result<(), AjoError> {
+    pub fn set_kyc_status(env: Env, admin: Address, member: Address, is_verified: bool) -> Result<(), AjoError> {
         Self::require_admin(&env, &admin)?;
-
         let mut kyc: Map<Address, bool> = env.storage().instance().get(&DataKey::KycStatus).unwrap_or_else(|| Map::new(&env));
         kyc.set(member, is_verified);
         env.storage().instance().set(&DataKey::KycStatus, &kyc);
         Ok(())
     }
 
-    /// Remove a dormant user. Restricted to ADMIN_ROLE.
     pub fn boot_dormant_member(env: Env, admin: Address, member: Address) -> Result<(), AjoError> {
         Self::require_admin(&env, &admin)?;
-        // ... (existing boot logic)
-        Ok(())
+        let mut standings: Map<Address, MemberStanding> = env.storage().instance().get(&DataKey::Standings).unwrap_or(Map::new(&env));
+        if let Some(mut standing) = standings.get(member.clone()) {
+            standing.is_active = false;
+            standings.set(member.clone(), standing);
+            env.storage().instance().set(&DataKey::Standings, &standings);
+            Ok(())
+        } else {
+            return Err(AjoError::NotFound);
+        }
     }
 }
