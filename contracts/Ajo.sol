@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 
-contract Ajo is Initializable {
-    address public admin;
+/**
+ * @title Ajo
+ * @dev A simple rotating savings and credit association (ROSCA) contract.
+ * Includes a pause mechanism for emergency situations.
+ */
+contract Ajo is Pausable, AccessControl {
     uint256 public contributionAmount;
+    uint256 public cycleDuration;
     uint32 public currentCycle;
-    uint32 public maxMembers;
+    uint256 public maxMembers;
     uint256 public totalPool;
 
+    /// @notice List of all members in the Ajo pool
     address[] public members;
 
     /// @notice Mapping from member address to their current balance in the pool
@@ -44,18 +51,38 @@ contract Ajo is Initializable {
      * @param _maxMembers The maximum capacity of the pool
      * @param _admin The administrator of the pool
      */
-    function initialize(uint256 _amount, uint32 _maxMembers, address _admin) public initializer {
-        admin = _admin;
-        contributionAmount = _amount;
+    constructor(
+        uint256 _contributionAmount,
+        uint256 _cycleDuration,
+        uint256 _maxMembers
+    ) {
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        contributionAmount = _contributionAmount;
+        cycleDuration = _cycleDuration;
         maxMembers = _maxMembers;
         currentCycle = 1;
     }
 
     /**
+     * @notice Allows the admin to pause the contract in case of emergency.
+     */
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _pause();
+    }
+
+    /**
+     * @notice Allows the admin to unpause the contract.
+     */
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        _unpause();
+    }
+
+    /**
      * @notice Allows a member to deposit the required contribution amount.
      * @dev Enforces strict deposit of contributionAmount and updates pool state.
+     * Can only be called when the contract is not paused.
      */
-    function deposit() external payable {
+    function deposit() external payable whenNotPaused {
         if(msg.value != contributionAmount) revert InvalidContribution();
         if(members.length >= maxMembers) revert AjoIsFull();
 
