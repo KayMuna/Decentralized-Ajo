@@ -1,4 +1,4 @@
-﻿//! # Ajo Circle Smart Contract
+//! # Ajo Circle Smart Contract
 //! Decentralized ROSCA implementation on Stellar (Soroban)
 
 #![no_std]
@@ -18,6 +18,9 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, Map,
     Symbol, Vec,
 };
+
+extern crate alloc;
+use alloc::vec::Vec as RustVec;
 
 pub const MAX_MEMBERS: u32 = 50;
 pub const MIN_CONTRIBUTION_AMOUNT: u128 = 1000000;
@@ -180,6 +183,20 @@ pub struct AjoCircle;
 #[contractimpl]
 impl AjoCircle {
     // ---------------- INTERNAL HELPERS ----------------
+    
+    /// Deterministic Fisher-Yates shuffle using a simple LCG.
+    /// This is a pure function, invariant and bijective.
+    pub fn deterministic_shuffle<T>(list: &mut [T], mut seed: u64) {
+        if list.is_empty() {
+            return;
+        }
+        for i in (1..list.len()).rev() {
+            // Simple LCG: x = (a*x + c) % m
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = (seed % (i as u64 + 1)) as usize;
+            list.swap(i, j);
+        }
+    }
 
     fn require_admin(env: &Env, caller: &Address) -> Result<(), AjoError> {
         caller.require_auth();
@@ -744,11 +761,31 @@ impl AjoCircle {
             .get(&DataKey::Members)
             .ok_or(AjoError::NotFound)?;
 
-        let mut rotation: Vec<Address> = Vec::new(&env);
+        // Collect addresses into a local buffer for shuffling
+        // Note: Soroban contracts use a small stack; for MAX_MEMBERS=50, this is safe.
+        let mut addrs: soroban_sdk::vec::Vec<Address> = soroban_sdk::vec::Vec::new(&env);
         for (addr, _) in members.iter() {
-            rotation.push_back(addr);
+            addrs.push_back(addr);
         }
-        env.storage().instance().set(&DataKey::RotationOrder, &rotation);
+        
+        // Convert to a temporary native Rust vector for pure-Rust shuffling
+        // (This avoids unnecessary host-calls during the shuffle loop)
+        let mut native_addrs: RustVec<Address> = alloc::vec::Vec::with_capacity(count);
+        for i in 0..count {
+            native_addrs.push(addrs.get(i as u32).unwrap());
+        }
+
+        // Use ledger timestamp as seed
+        let seed = env.ledger().timestamp();
+        Self::deterministic_shuffle(&mut native_addrs, seed);
+
+        // Store the result back into Soroban Vec
+        let mut shuffled: Vec<Address> = Vec::new(&env);
+        for addr in native_addrs {
+            shuffled.push_back(addr);
+        }
+        
+        env.storage().instance().set(&DataKey::RotationOrder, &shuffled);
 
         Ok(())
     }
